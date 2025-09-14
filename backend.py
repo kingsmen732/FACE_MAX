@@ -2,19 +2,16 @@
 from google.protobuf import message_factory as mf
 from google.protobuf import symbol_database as sdb
 
-# Patch MessageFactory
 if not hasattr(mf.MessageFactory, "GetPrototype"):
     def _get_prototype(self, descriptor):
         return self.GetMessageClass(descriptor)
     mf.MessageFactory.GetPrototype = _get_prototype
 
-# Patch SymbolDatabase
 if not hasattr(sdb.SymbolDatabase, "GetPrototype"):
     def _get_prototype_db(self, descriptor):
         return self.GetMessageClass(descriptor)
     sdb.SymbolDatabase.GetPrototype = _get_prototype_db
 # ---------------------------------------------------
-
 
 import os
 import io
@@ -22,13 +19,14 @@ import numpy as np
 import cv2
 import mediapipe as mp
 from PIL import Image
-import streamlit as st
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from supabase import create_client, Client
-import requests  # for Groq API call
+import requests
+from fastapi import FastAPI, UploadFile, Form, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-# Load env
+# Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -41,49 +39,17 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Auth state
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_email = ""
+app = FastAPI(title="Face Maxing API")
 
-def login():
-    st.title("Login")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
+# Allow CORS (for frontend clients)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    if st.button("Login"):
-        try:
-            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            if response.user:
-                st.session_state.logged_in = True
-                st.session_state.user_email = email
-                st.success("Logged in successfully!")
-                st.rerun()
-            else:
-                st.error("Login failed. Please check your credentials.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-def signup():
-    st.title("Sign Up")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Sign Up"):
-        try:
-            response = supabase.auth.sign_up({"email": email, "password": password})
-            if response.user:
-                st.success("Sign up successful! Check your email to confirm your account.")
-            else:
-                st.error("Sign up failed.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-def logout():
-    st.session_state.logged_in = False
-    st.session_state.user_email = ""
-    st.success("Logged out successfully.")
-    st.rerun()
 
 class HabitAnswers(BaseModel):
     sleep_hours: float
@@ -94,6 +60,9 @@ class HabitAnswers(BaseModel):
     gender: str
     ethnicity: str
 
+
+# ------------------- Analysis Functions -------------------
+
 def measure_symmetry(landmarks):
     left = [landmarks[i] for i in range(0, 234)]
     right = [landmarks[i] for i in range(234, 468)]
@@ -103,6 +72,7 @@ def measure_symmetry(landmarks):
     avg_diff = diff_sum / len(left)
     return max(0.0, 1 - avg_diff * 5)
 
+
 def measure_jawline(landmarks):
     jaw_indices = [152, 234, 454]
     points = [(landmarks[i].x, landmarks[i].y) for i in jaw_indices]
@@ -111,11 +81,13 @@ def measure_jawline(landmarks):
     ratio = height / (width + 1e-6)
     return min(1.0, ratio / 1.5)
 
+
 def analyze_skin(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian = cv2.Laplacian(gray, cv2.CV_64F).var()
     blur_score = max(0.0, min(1.0, 1 / (laplacian + 1e-6)))
     return 1 - blur_score
+
 
 def measure_eye_symmetry(landmarks):
     left_eye = [landmarks[i] for i in [33, 133]]
@@ -123,6 +95,7 @@ def measure_eye_symmetry(landmarks):
     dist_left = abs(left_eye[0].x - left_eye[1].x)
     dist_right = abs(right_eye[0].x - right_eye[1].x)
     return 1 - abs(dist_left - dist_right)
+
 
 def measure_face_proportion(landmarks):
     top = landmarks[10].y
@@ -134,12 +107,14 @@ def measure_face_proportion(landmarks):
     ratio = height / (width + 1e-6)
     return min(1.0, 1 - abs(ratio - 1.6))
 
+
 def measure_lip_symmetry(landmarks):
     left_lip = landmarks[61].x
     right_lip = landmarks[291].x
     center = (left_lip + right_lip) / 2
     diff = abs(center - 0.5)
     return max(0.0, 1 - diff * 5)
+
 
 def analyze_image(image_bytes: bytes) -> float:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -169,6 +144,7 @@ def analyze_image(image_bytes: bytes) -> float:
         )
         return round(current_score * 100, 2)
 
+
 def calculate_habit_score(answers: HabitAnswers) -> float:
     score = 0.0
     score += min(answers.sleep_hours / 8, 1.0) * 2
@@ -178,6 +154,7 @@ def calculate_habit_score(answers: HabitAnswers) -> float:
     score += min(answers.hydration_liters / 2, 1.0) * 2
     score += 0 if answers.eats_processed else 1
     return min(score, 5.0)
+
 
 def get_groq_improvements(habits: HabitAnswers, current_score: float) -> str:
     prompt = (
@@ -201,7 +178,7 @@ def get_groq_improvements(habits: HabitAnswers, current_score: float) -> str:
     body = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a beauty and skincare expert giving advice to users based on lifestyle habits. give only actionable advice as a doctor only in text format"},
+            {"role": "system", "content": "You are a beauty and skincare expert giving advice."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
@@ -216,30 +193,25 @@ def get_groq_improvements(habits: HabitAnswers, current_score: float) -> str:
     except Exception as e:
         return f"Error fetching improvements: {e}"
 
-# UI Navigation
-if not st.session_state.logged_in:
-    nav = st.radio("Welcome", ["Login", "Sign Up"])
-    if nav == "Login":
-        login()
-    else:
-        signup()
-else:
-    st.title("Face Maxing App: Upload Face + Habits")
-    user_id = st.session_state.user_email
-    uploaded_file = st.file_uploader("Upload your face image", type=["jpg", "png", "jpeg"])
 
-    st.subheader("Lifestyle Questions")
-    sleep_hours = st.slider("Hours of sleep", 0.0, 12.0, 7.0)
-    skincare = st.checkbox("Do you follow a skincare routine?")
-    workout_freq = st.selectbox("Workout frequency", ['none', '1-2', '3-5', '6+'])
-    hydration = st.slider("Liters of water per day", 0.0, 5.0, 2.0)
-    eats_processed = st.checkbox("Do you frequently eat processed foods?")
-    gender = st.selectbox("Gender", ["male", "female"])
-    ethnicity = st.selectbox("Ethnicity", ["Asian", "American", "African", "Latino", "Other"])
+# ------------------- API Routes -------------------
 
-    if st.button("Submit All") and user_id and uploaded_file:
-        contents = uploaded_file.read()
+@app.post("/analyze")
+async def analyze_face(
+    file: UploadFile,
+    email: str = Form(...),
+    sleep_hours: float = Form(...),
+    skincare: bool = Form(...),
+    workout_freq: str = Form(...),
+    hydration: float = Form(...),
+    eats_processed: bool = Form(...),
+    gender: str = Form(...),
+    ethnicity: str = Form(...),
+):
+    try:
+        contents = await file.read()
         current_score = analyze_image(contents)
+
         answers = HabitAnswers(
             sleep_hours=sleep_hours,
             skincare=skincare,
@@ -249,44 +221,36 @@ else:
             gender=gender,
             ethnicity=ethnicity
         )
+
         habit_score = calculate_habit_score(answers)
         potential_score = min(current_score + habit_score, 100)
 
-        file_path = f"{user_id}/{uploaded_file.name}"
-        try:
-            res = supabase.storage.from_("images").upload(file_path, contents)
-            if getattr(res, 'error', None):
-                st.error(f"Failed to upload image: {res.error}")
-                st.stop()
-            image_url = f"{SUPABASE_URL}/storage/v1/object/public/images/{file_path}"
+        # Save to Supabase storage
+        file_path = f"{email}/{file.filename}"
+        res = supabase.storage.from_("images").upload(file_path, contents, {"upsert": True})
+        if getattr(res, 'error', None):
+            raise HTTPException(status_code=500, detail=f"Image upload failed: {res.error}")
 
-            supabase.table("face_scores").insert({
-                "user_id": user_id,
-                "image_url": image_url,
-                "current_score": current_score,
-                "potential_score": potential_score
-            }).execute()
+        image_url = f"{SUPABASE_URL}/storage/v1/object/public/images/{file_path}"
 
-            supabase.table("habit_answers").insert({"user_id": user_id, **answers.dict()}).execute()
+        # Save to Supabase DB
+        supabase.table("face_scores").insert({
+            "user_id": email,
+            "image_url": image_url,
+            "current_score": current_score,
+            "potential_score": potential_score
+        }).execute()
 
-            improvements = get_groq_improvements(answers, current_score)
+        supabase.table("habit_answers").insert({"user_id": email, **answers.dict()}).execute()
 
-            st.success(f"Submission successful!")
-            st.metric("Current Score", current_score)
-            st.metric("Potential Score", potential_score)
-            st.markdown("### Suggested Improvements from AI:")
-            st.write(improvements)
+        improvements = get_groq_improvements(answers, current_score)
 
-        except Exception as e:
-            st.error(f"Error during submission: {e}")
-
-    elif st.button("Get Last Results") and user_id:
-        data = supabase.table("face_scores").select("current_score", "potential_score").eq("user_id", user_id).order("submitted_at", desc=True).limit(1).execute()
-        if not data.data:
-            st.write("No data found")
-        else:
-            st.metric("Current Score", data.data[0]["current_score"])
-            st.metric("Potential Score", data.data[0]["potential_score"])
-
-    if st.button("Logout"):
-        logout()
+        return {
+            "status": "success",
+            "current_score": current_score,
+            "potential_score": potential_score,
+            "improvements": improvements,
+            "image_url": image_url,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
