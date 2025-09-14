@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+mediapipe
+tensorflow
+numpy
+opencv-python-headless
+pillow
+python-dotenv
+pydantic
+supabase
+requests
+supabase-py
